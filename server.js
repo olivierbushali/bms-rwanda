@@ -1,0 +1,38 @@
+const express=require("express"),session=require("express-session"),bcrypt=require("bcryptjs"),{Pool}=require("pg");
+const app=express(),PORT=process.env.PORT||3000;
+if(!process.env.DATABASE_URL) console.warn("DATABASE_URL is not set");
+const pool=new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.DATABASE_URL?{rejectUnauthorized:false}:false});
+app.use(express.json());app.use(express.static("public"));
+app.use(session({secret:process.env.SESSION_SECRET||"CHANGE_ME",resave:false,saveUninitialized:false,cookie:{httpOnly:true,secure:process.env.NODE_ENV==="production"}}));
+async function q(sql,p=[]){return (await pool.query(sql,p)).rows}
+async function init(){
+ await q(`CREATE TABLE IF NOT EXISTS users(id SERIAL PRIMARY KEY,name TEXT NOT NULL,username TEXT UNIQUE NOT NULL,password TEXT NOT NULL,role TEXT NOT NULL DEFAULT 'Cashier',created_at TIMESTAMPTZ DEFAULT now());
+ CREATE TABLE IF NOT EXISTS customers(id SERIAL PRIMARY KEY,name TEXT NOT NULL,phone TEXT,email TEXT,notes TEXT,created_at TIMESTAMPTZ DEFAULT now());
+ CREATE TABLE IF NOT EXISTS products(id SERIAL PRIMARY KEY,name TEXT NOT NULL,sku TEXT,category TEXT,price NUMERIC DEFAULT 0,cost NUMERIC DEFAULT 0,stock NUMERIC DEFAULT 0,min_stock NUMERIC DEFAULT 0,created_at TIMESTAMPTZ DEFAULT now());
+ CREATE TABLE IF NOT EXISTS sales(id SERIAL PRIMARY KEY,customer_id INT REFERENCES customers(id) ON DELETE SET NULL,product_id INT REFERENCES products(id) ON DELETE SET NULL,qty NUMERIC DEFAULT 0,total NUMERIC DEFAULT 0,payment_method TEXT,date TIMESTAMPTZ DEFAULT now(),user_id INT REFERENCES users(id));
+ CREATE TABLE IF NOT EXISTS visits(id SERIAL PRIMARY KEY,customer_id INT REFERENCES customers(id) ON DELETE SET NULL,product TEXT,status TEXT,reason TEXT,followup_date DATE,user_id INT REFERENCES users(id),created_at TIMESTAMPTZ DEFAULT now());
+ CREATE TABLE IF NOT EXISTS expenses(id SERIAL PRIMARY KEY,category TEXT,description TEXT,amount NUMERIC DEFAULT 0,date DATE DEFAULT CURRENT_DATE,user_id INT REFERENCES users(id),created_at TIMESTAMPTZ DEFAULT now());
+ CREATE TABLE IF NOT EXISTS logs(id SERIAL PRIMARY KEY,user_id INT REFERENCES users(id),action TEXT,entity TEXT,entity_id INT,created_at TIMESTAMPTZ DEFAULT now());`);
+ const u=await q("SELECT id FROM users LIMIT 1"); if(!u.length) await q("INSERT INTO users(name,username,password,role) VALUES($1,$2,$3,$4)",["Administrator","admin",bcrypt.hashSync("admin123",10),"Admin"]);
+}
+const auth=(req,res,next)=>req.session.user?next():res.status(401).json({error:"Login required"});
+async function log(user,action,entity,id){await q("INSERT INTO logs(user_id,action,entity,entity_id) VALUES($1,$2,$3,$4)",[user,action,entity,id||null])}
+app.post("/api/login",async(req,res)=>{try{let u=(await q("SELECT * FROM users WHERE username=$1",[req.body.username]))[0];if(!u||!bcrypt.compareSync(req.body.password||"",u.password))return res.status(401).json({error:"Username or password is incorrect"});req.session.user={id:u.id,name:u.name,role:u.role};res.json(req.session.user)}catch(e){res.status(500).json({error:e.message})}});
+app.post("/api/logout",(req,res)=>req.session.destroy(()=>res.json({ok:true})));
+app.get("/api/me",(req,res)=>res.json(req.session.user||null));
+app.get("/api/dashboard",auth,async(req,res)=>{try{
+ const [s,e,c,v,p]=await Promise.all([q("SELECT COALESCE(SUM(total),0) n FROM sales WHERE date>=date_trunc('month',CURRENT_DATE)"),q("SELECT COALESCE(SUM(amount),0) n FROM expenses WHERE date>=date_trunc('month',CURRENT_DATE)"),q("SELECT COUNT(*) n FROM customers"),q("SELECT COUNT(*) n FROM visits WHERE status='Not bought'"),q("SELECT COUNT(*) n FROM products WHERE stock<=min_stock")]);
+ const today=await q("SELECT COALESCE(SUM(total),0) n FROM sales WHERE date::date=CURRENT_DATE");
+ const buyers=await q("SELECT COUNT(DISTINCT customer_id) n FROM sales WHERE customer_id IS NOT NULL AND date>=date_trunc('month',CURRENT_DATE)");
+ const rs=await q("SELECT COALESCE(NULLIF(reason,''),'Other') reason,COUNT(*) n FROM visits WHERE status='Not bought' GROUP BY 1 ORDER BY n DESC");
+ res.json({salesToday:+today[0].n,salesMonth:+s[0].n,expensesMonth:+e[0].n,profit:+s[0].n-+e[0].n,customers:+c[0].n,buyers:+buyers[0].n,nonBuyers:+v[0].n,lowStock:+p[0].n,reasons:Object.fromEntries(rs.map(x=>[x.reason,+x.n]))});
+}catch(e){res.status(500).json({error:e.message})}});
+const maps={customers:["SELECT * FROM customers ORDER BY id DESC"],products:["SELECT * FROM products ORDER BY id DESC"],sales:["SELECT * FROM sales ORDER BY id DESC"],visits:["SELECT * FROM visits ORDER BY id DESC"],expenses:["SELECT * FROM expenses ORDER BY id DESC"],logs:["SELECT l.*,u.name user_name FROM logs l LEFT JOIN users u ON u.id=l.user_id ORDER BY l.id DESC"]};
+app.get("/api/:type",auth,async(req,res)=>{if(!maps[req.params.type])return res.status(404).end();try{res.json(await q(maps[req.params.type][0]))}catch(e){res.status(500).json({error:e.message})}});
+app.post("/api/customers",auth,async(req,res)=>{try{let r=(await q("INSERT INTO customers(name,phone,email,notes) VALUES($1,$2,$3,$4) RETURNING *",[req.body.name,req.body.phone,req.body.email,req.body.notes]))[0];await log(req.session.user.id,"CREATE","customers",r.id);res.json(r)}catch(e){res.status(500).json({error:e.message})}});
+app.post("/api/products",auth,async(req,res)=>{try{let r=(await q("INSERT INTO products(name,sku,category,price,cost,stock,min_stock) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *",[req.body.name,req.body.sku,req.body.category,+req.body.price||0,+req.body.cost||0,+req.body.stock||0,+req.body.min_stock||0]))[0];await log(req.session.user.id,"CREATE","products",r.id);res.json(r)}catch(e){res.status(500).json({error:e.message})}});
+app.post("/api/visits",auth,async(req,res)=>{try{let r=(await q("INSERT INTO visits(customer_id,product,status,reason,followup_date,user_id) VALUES($1,$2,$3,$4,$5,$6) RETURNING *",[req.body.customer_id||null,req.body.product,req.body.status,req.body.reason,req.body.followup_date||null,req.session.user.id]))[0];await log(req.session.user.id,"CREATE","visits",r.id);res.json(r)}catch(e){res.status(500).json({error:e.message})}});
+app.post("/api/sales",auth,async(req,res)=>{const client=await pool.connect();try{await client.query("BEGIN");let r=(await client.query("INSERT INTO sales(customer_id,product_id,qty,total,payment_method,user_id) VALUES($1,$2,$3,$4,$5,$6) RETURNING *",[req.body.customer_id||null,req.body.product_id||null,+req.body.qty||0,+req.body.total||0,req.body.payment_method,req.session.user.id])).rows[0];if(req.body.product_id)await client.query("UPDATE products SET stock=stock-$1 WHERE id=$2",[+req.body.qty||0,req.body.product_id]);await client.query("COMMIT");await log(req.session.user.id,"CREATE","sales",r.id);res.json(r)}catch(e){await client.query("ROLLBACK");res.status(500).json({error:e.message})}finally{client.release()}});
+app.post("/api/expenses",auth,async(req,res)=>{try{let r=(await q("INSERT INTO expenses(category,description,amount,date,user_id) VALUES($1,$2,$3,$4,$5) RETURNING *",[req.body.category,req.body.description,+req.body.amount||0,req.body.date||null,req.session.user.id]))[0];await log(req.session.user.id,"CREATE","expenses",r.id);res.json(r)}catch(e){res.status(500).json({error:e.message})}});
+app.delete("/api/:type/:id",auth,async(req,res)=>{if(!["customers","products","visits","expenses"].includes(req.params.type))return res.status(403).end();try{await q(`DELETE FROM ${req.params.type} WHERE id=$1`,[req.params.id]);await log(req.session.user.id,"DELETE",req.params.type,req.params.id);res.json({ok:true})}catch(e){res.status(500).json({error:e.message})}});
+init().then(()=>app.listen(PORT,"0.0.0.0",()=>console.log("BMS online on port "+PORT))).catch(e=>{console.error(e);process.exit(1)});
